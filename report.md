@@ -2,127 +2,208 @@
 
 ## 1. Project Overview
 
-This project implements a secure instant messaging tool for Alice and Bob. The program provides a graphical user interface, a TCP socket connection, encrypted message transmission, ciphertext display, plaintext recovery, and periodic key updates.
+This project implements a secure instant messaging tool for Alice and Bob. The program provides a graphical user interface, a TCP socket connection, encrypted message transmission, ciphertext display, plaintext recovery, message authentication, and periodic key updates.
 
-Alice and Bob can run two copies of `secure_p2p_messenger.py`. One peer starts in **Listen** mode and the other peer starts in **Connect** mode. After a secure session is ready, either side can send messages.
+Alice and Bob run two copies of `secure_p2p_messenger.py`. One peer clicks **Start Listening** to open a server socket. The other peer enters the listener's host and port and clicks **Connect**. After the secure session is ready, either side can send messages.
 
 ## 2. Cipher Selection
 
-The system uses **AES-256-GCM** from the Python `cryptography` package.
+The system uses **AES-256-CBC** through the system `openssl` command.
 
-AES-256 uses a 256-bit key, which is greater than the required minimum of 56 bits. GCM mode provides both confidentiality and integrity. This means the message is encrypted, and the receiver can also detect whether the ciphertext, nonce, authentication tag, or associated metadata was modified.
+AES-256 uses a 256-bit encryption key, which is greater than the assignment requirement of at least 56 bits. CBC mode provides confidentiality. Because CBC mode does not provide integrity by itself, the project also computes a separate **HMAC-SHA-256** authentication tag for each encrypted message.
+
+The effective message protection is:
+
+```text
+AES-256-CBC encryption + HMAC-SHA-256 authentication
+```
+
+This encrypt-then-MAC design lets the receiver detect tampering before attempting decryption.
 
 ## 3. Key Generation from Shared Password
 
-The password is not used directly as the AES key. Instead, Alice and Bob type the same passphrase into their local GUI. After the TCP connection is established, the listener sends a fresh random 16-byte session salt to the connector. The program derives a 256-bit root secret using:
+The password is never used directly as the AES key. Alice and Bob type the same shared passphrase into their local GUI. During connection setup, both peers generate a fresh random 16-byte salt and exchange it in a `HELLO` frame.
 
-- PBKDF2-HMAC-SHA256
-- 200,000 iterations
-- A fresh session salt
-- 32-byte output
+Both peers sort the two salts, hash them together, and then derive a shared 32-byte chain secret using:
 
-Because Alice and Bob use the same passphrase, the same session salt, and the same PBKDF2 parameters, they derive the same root secret independently. An attacker who sees the network traffic may see the salt, but the salt is not secret and does not reveal the passphrase or the derived key. A fresh salt also prevents the same passphrase from producing the same root key in every chat session.
+```text
+PBKDF2-HMAC-SHA-256(passphrase, combined_salt, 200000 iterations)
+```
+
+Because both sides use the same passphrase, the same two salts, and the same PBKDF2 parameters, they independently derive the same chain secret. The salts are not secret, but they ensure that the same passphrase does not produce the same session keys every time.
+
+For each key epoch, the program derives 64 bytes of key material from the chain secret using an HMAC-SHA-256 based derivation function:
+
+- first 32 bytes: AES-256 encryption key
+- last 32 bytes: HMAC-SHA-256 MAC key
 
 ## 4. Padding Design
 
-The project uses AES-GCM, which does not require padding. This is better than using a block mode that requires manual padding because incorrect padding handling can introduce security bugs. The plaintext can be any UTF-8 message length, including short messages such as `ok`.
+AES-CBC is a block cipher mode, so plaintext must be padded to a 16-byte block boundary. The project uses OpenSSL's AES-CBC implementation, which applies standard **PKCS#7 padding** by default.
 
-## 5. Random Nonces and Different Ciphertexts
+This means messages of any length can be encrypted, including short messages such as `ok`.
 
-Every message uses a fresh random 96-bit nonce generated with `os.urandom(12)`. AES-GCM encryption uses the nonce, the epoch key, and the plaintext.
+## 5. Random IVs and Different Ciphertexts
 
-If Alice sends the same plaintext multiple times, the nonce changes each time. Therefore the resulting ciphertext changes each time. This prevents an observer from learning that two encrypted messages contain the same plaintext.
+Every message uses a fresh random 16-byte IV generated with:
 
-## 6. GUI Functions
+```python
+os.urandom(16)
+```
 
-The GUI is implemented with Python Tkinter. It supports:
+The IV is sent with the encrypted frame. Because CBC encryption depends on the IV, sending the same plaintext multiple times produces different ciphertext each time. For example, if Alice sends `ok` twice, the IV changes, so the ciphertext also changes.
 
-- Choosing **Listen** or **Connect**
-- Entering host and port
-- Entering a shared passphrase
-- Selecting password mode or X25519 handshake mode
-- Sending plaintext messages
-- Displaying sent ciphertext
-- Displaying received ciphertext
-- Displaying decrypted plaintext
-- Showing session status and key fingerprint information
+## 6. Message Integrity and Authentication
 
-When Alice sends a message, her GUI shows the nonce, key epoch, and ciphertext plus authentication tag. When Bob receives it, Bob's GUI shows the received ciphertext and the decrypted plaintext.
+After encryption, the sender computes:
 
-## 7. Network Connection
+```text
+HMAC-SHA-256(mac_key, "DATA" || epoch || IV || ciphertext)
+```
+
+The HMAC tag is sent with the message. The receiver recomputes the expected tag and compares it using `hmac.compare_digest`, which is designed for constant-time comparison.
+
+If the ciphertext, IV, epoch, or tag is modified, verification fails and the message is rejected before decryption. This prevents unauthenticated ciphertext from being decrypted.
+
+## 7. GUI Functions
+
+The GUI is implemented with Python Tkinter. The project uses a conda environment with Tcl/Tk 8.6 or newer because Apple's system Tk 8.5 is deprecated and rendered the GUI incorrectly on macOS.
+
+The GUI supports:
+
+- entering a local display name
+- entering a shared passphrase
+- entering listen port
+- entering peer host and peer port
+- starting a listener
+- connecting to a listener
+- sending plaintext messages
+- displaying sent ciphertext
+- displaying received ciphertext
+- displaying decrypted plaintext
+- manually rotating keys with **Rekey Now**
+- closing the session
+
+When Alice sends a message, her GUI displays the sent ciphertext. When Bob receives it, Bob's GUI displays the received ciphertext and decrypted plaintext.
+
+## 8. Network Connection
 
 The project uses TCP sockets.
 
-One peer creates a server socket with `bind`, `listen`, and `accept`. The other peer uses `connect` to reach the listener. After the connection is established, messages are exchanged as length-prefixed JSON frames.
+The listener calls:
 
-Each encrypted message frame contains:
+```text
+socket()
+bind()
+listen()
+accept()
+```
 
-- `type`: message
-- `epoch`: key epoch number
-- `nonce`: Base64-encoded AES-GCM nonce
-- `ciphertext`: Base64-encoded ciphertext and GCM authentication tag
+The connector calls:
 
-Length-prefixed frames are used so the receiver can identify exactly where each JSON message starts and ends.
+```text
+socket.create_connection()
+```
 
-## 8. Key Management and Periodic Updates
+After the socket connects, both peers exchange `HELLO` frames containing:
 
-The program does not use one AES key forever. It derives a new AES-256 message key for each epoch using HKDF-SHA256:
+- protocol version
+- display name
+- random salt
+- cipher description
+- KDF description
 
-`epoch_key = HKDF(root_secret, info = "CS5173 secure p2p messenger epoch N")`
+Application messages are sent as length-prefixed JSON frames. A 4-byte big-endian length field is sent first, followed by the UTF-8 JSON payload. This lets the receiver identify exactly where each message starts and ends on the TCP stream.
 
-The sender rotates to a new epoch after 5 sent messages or 120 seconds, whichever happens first. The epoch number is included in the encrypted message metadata, so the receiver can derive the same epoch key and decrypt the message.
+Encrypted data frames contain:
 
-This improves security because less data is protected by any single AES key. If an epoch key were somehow exposed, only messages in that epoch would be affected. HKDF also provides cryptographic separation between keys for different epochs.
+- `type`: `DATA`
+- `sender`: sender display name
+- `epoch`: current key epoch
+- `iv`: Base64-encoded AES-CBC IV
+- `ciphertext`: Base64-encoded ciphertext
+- `tag`: Base64-encoded HMAC tag
 
-## 9. Integrity and Authentication
+## 9. Key Management and Periodic Updates
 
-AES-GCM produces an authentication tag. The receiver verifies this tag automatically during decryption. If an attacker modifies any bit of the ciphertext or uses the wrong key, decryption fails and the GUI displays an authentication error.
+The program does not use one encryption key forever. It maintains an epoch number. Each epoch has a separate AES key and HMAC key derived from the current chain secret.
 
-The epoch number is included as associated authenticated data. This prevents an attacker from moving ciphertext between key epochs without detection.
+The program automatically rekeys after every 10 locally sent messages. The user can also click **Rekey Now**.
 
-## 10. Extra Credit: No Pre-Shared Password Mode
+A rekey operation sends an authenticated `REKEY` frame containing:
 
-The project includes an optional **X25519 handshake** mode. In this mode, Alice and Bob do not need a shared password.
+- next epoch number
+- fresh random 32-byte nonce
+- HMAC tag over the rekey data
 
-The handshake works as follows:
+Both peers update the chain secret with:
 
-1. Each peer generates a temporary X25519 private/public key pair.
-2. The peers exchange public keys over the TCP connection.
-3. Each peer computes the same Diffie-Hellman shared secret.
-4. HKDF-SHA256 derives the AES root secret from the shared secret and handshake transcript.
-5. The GUI displays a SHA-256 fingerprint of the handshake transcript.
+```text
+HMAC-SHA-256(old_chain_secret, "secure-p2p-rekey-v1" || next_epoch || nonce)
+```
 
-Alice and Bob should compare the displayed fingerprint over a trusted side channel, such as a phone call or in-person comparison. If the fingerprints match, they know they derived the same key and no man-in-the-middle attacker changed the handshake keys.
+Then both sides derive new AES and HMAC keys for the new epoch.
 
-This gives forward secrecy because the X25519 private keys are temporary and are not saved after the program exits.
+This improves security because less traffic is protected by any single key. If one epoch key were later exposed, future epochs would still be protected by newly derived key material.
 
-## 11. Major Functions
+## 10. Major Functions
 
-`derive_password_root(passphrase)` derives the root secret from the shared passphrase using PBKDF2-HMAC-SHA256.
+`CryptoContext.__init__` derives the shared chain secret from the passphrase and exchanged salts using PBKDF2-HMAC-SHA-256.
 
-`derive_epoch_key(root_secret, epoch)` derives each AES-GCM epoch key using HKDF-SHA256.
+`CryptoContext._derive_epoch_keys` derives the AES encryption key and HMAC key for the current epoch.
 
-`SecureSession.encrypt(plaintext)` generates a random nonce, encrypts the plaintext with AES-256-GCM, and returns a JSON-ready payload.
+`CryptoContext.encrypt` generates a random IV, encrypts the plaintext with AES-256-CBC, and computes the HMAC tag.
 
-`SecureSession.decrypt(payload)` extracts the epoch, nonce, and ciphertext, derives the correct epoch key, verifies the AES-GCM tag, and returns the plaintext.
+`CryptoContext.decrypt` verifies the HMAC tag and decrypts the ciphertext only if authentication succeeds.
 
-`PeerConnection.listen(...)` starts the server side of the TCP connection.
+`CryptoContext.make_rekey_frame` creates an authenticated key update frame and advances the local epoch.
 
-`PeerConnection.connect(...)` starts the client side of the TCP connection.
+`CryptoContext.accept_rekey_frame` verifies a received rekey frame and advances the receiver to the new epoch.
 
-`MessengerGUI` builds the graphical interface, displays ciphertext and plaintext, and calls the networking and cryptographic functions.
+`PeerSession.start` exchanges `HELLO` frames and initializes the secure session.
 
-## 12. Testing Plan and Screenshots
+`send_frame` and `recv_frame` implement length-prefixed JSON framing over TCP.
+
+`SecureMessengerApp` builds the GUI and connects user actions to the secure networking layer.
+
+## 11. Testing Plan and Screenshots
 
 Suggested report screenshots:
 
-1. Alice in Listen mode and Bob in Connect mode.
-2. Both peers showing "Secure session ready".
-3. Alice sending `ok` once and Bob receiving the ciphertext and plaintext.
-4. Alice sending `ok` again, showing a different nonce and different ciphertext.
-5. Several sent messages showing the epoch number increasing after key rotation.
-6. Optional X25519 mode with matching fingerprints displayed on both peers.
+1. Alice's GUI with name, passphrase, listen port, and **Start Listening**.
+2. Bob's GUI with name, passphrase, peer host, peer port, and **Connect**.
+3. Both peers showing a connected status.
+4. Alice sending `ok` once and Bob displaying the received ciphertext and plaintext.
+5. Alice sending `ok` again, showing a different ciphertext.
+6. Manual key update using **Rekey Now**.
+7. Automatic key update after 10 sent messages.
+
+The built-in self-test can be run with:
+
+```bash
+python secure_p2p_messenger.py --self-test
+```
+
+The test verifies:
+
+- repeated plaintext produces different ciphertext
+- Alice and Bob derive compatible keys from the same passphrase
+- rekeying synchronizes both peers to the same epoch
+- tampered ciphertext fails HMAC verification
+
+## 12. Environment Setup
+
+The repository includes `environment.yml` for conda:
+
+```bash
+conda env create -f environment.yml
+conda activate secure-p2p
+python secure_p2p_messenger.py --tk-version
+python secure_p2p_messenger.py
+```
+
+The `--tk-version` option confirms that the program is using Tcl/Tk 8.6 or newer instead of Apple's deprecated system Tk 8.5.
 
 ## 13. Conclusion
 
-The project satisfies the main requirements by using a modern cipher with a key length greater than 56 bits, deriving keys from a passphrase instead of using the password directly, avoiding padding mistakes with AES-GCM, using random nonces for different ciphertexts, providing a GUI, maintaining a TCP socket connection, and periodically rotating encryption keys.
+The project satisfies the main requirements by using a cipher with a key length greater than 56 bits, deriving encryption keys from a shared passphrase instead of using the password directly, applying PKCS#7 padding through OpenSSL, using random IVs so repeated messages encrypt differently, authenticating messages with HMAC-SHA-256, providing a GUI, maintaining a TCP socket connection, and periodically rotating keys.
